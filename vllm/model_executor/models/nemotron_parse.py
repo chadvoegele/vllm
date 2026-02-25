@@ -16,7 +16,6 @@ import torch
 import torch.nn as nn
 from einops import rearrange
 from PIL import Image
-from timm.data.constants import OPENAI_CLIP_MEAN, OPENAI_CLIP_STD
 from torchvision import transforms as T
 from transformers import (
     BartConfig,
@@ -371,7 +370,244 @@ class NemotronParsePixelInputs(TensorSchema):
     data: Annotated[torch.Tensor, TensorShape("b", 3, "h", "w")]
 
 
-class NemotronParseImageProcessor:
+from typing import ClassVar
+from transformers.image_utils import ImageInput
+from typing import ClassVar, Dict, List, Optional, Union
+from transformers.utils import TensorType
+import albumentations as A
+import cv2
+from transformers import BaseImageProcessor, ImageProcessingMixin, ProcessorMixin
+
+class NemotronParseImageProcessor(BaseImageProcessor, ImageProcessingMixin):
+    """
+    Image processor for NemotronParse model.
+
+    This processor inherits from BaseImageProcessor to be compatible with transformers AutoImageProcessor.
+    """
+
+    model_input_names: ClassVar = ["pixel_values"]
+
+    def __init__(
+        self,
+        final_size: tuple = (2048, 1664),
+        **kwargs,
+    ):
+        clean_kwargs = {}
+        for k, v in kwargs.items():
+            if not k.startswith("_") and k not in ["transform", "torch_transform"]:
+                clean_kwargs[k] = v
+
+        if "size" in clean_kwargs:
+            size_config = clean_kwargs.pop("size")
+            if isinstance(size_config, dict):
+                if "longest_edge" in size_config:
+                    longest_edge = size_config["longest_edge"]
+                    if isinstance(longest_edge, (list, tuple)):
+                        final_size = tuple(int(x) for x in longest_edge)
+                    else:
+                        final_size = (int(longest_edge), int(longest_edge))
+                elif "height" in size_config and "width" in size_config:
+                    final_size = (int(size_config["height"]), int(size_config["width"]))
+
+        super().__init__(**clean_kwargs)
+
+        if isinstance(final_size, (list, tuple)) and len(final_size) >= 2:
+            self.final_size = (int(final_size[0]), int(final_size[1]))
+        elif isinstance(final_size, (int, float)):
+            self.final_size = (int(final_size), int(final_size))
+        else:
+            self.final_size = (2048, 1664)  # Default fallback
+
+        self._create_transforms()
+
+    def _create_transforms(self):
+        """Create transform objects (not serialized to JSON)."""
+        if isinstance(self.final_size, (list, tuple)):
+            self.target_height, self.target_width = int(self.final_size[0]), int(self.final_size[1])
+        else:
+            self.target_height = self.target_width = int(self.final_size)
+
+        self.transform = A.Compose(
+            [
+                A.PadIfNeeded(
+                    min_height=self.target_height,
+                    min_width=self.target_width,
+                    border_mode=cv2.BORDER_CONSTANT,
+                    fill=[255, 255, 255],
+                    p=1.0,
+                ),
+            ]
+        )
+
+        self.torch_transform = T.Compose(
+            [
+                T.ToTensor(),
+                # Note: Normalization is done within RADIO model
+            ]
+        )
+
+    def to_dict(self):
+        """Override to exclude non-serializable transforms."""
+        output = super().to_dict()
+        output.pop("transform", None)
+        output.pop("torch_transform", None)
+        return output
+
+    @classmethod
+    def from_dict(cls, config_dict: dict, **kwargs):
+        """Override to recreate transforms after loading."""
+        config_dict = config_dict.copy()
+        config_dict.pop("transform", None)
+        config_dict.pop("torch_transform", None)
+
+        # Clean any problematic entries
+        for key in list(config_dict.keys()):
+            if key.startswith("_") or config_dict[key] is None:
+                config_dict.pop(key, None)
+
+        # Ensure numeric types are correct
+        if "final_size" in config_dict:
+            final_size = config_dict["final_size"]
+            if isinstance(final_size, (list, tuple)):
+                config_dict["final_size"] = tuple(int(x) for x in final_size)
+
+        try:
+            return cls(**config_dict, **kwargs)
+        except Exception as e:
+            print(f"Warning: Error in from_dict: {e}")
+            print("Using default parameters...")
+            return cls(**kwargs)
+
+    def save_pretrained(self, save_directory, **kwargs):
+        """Save image processor configuration."""
+        import os
+
+        os.makedirs(save_directory, exist_ok=True)
+
+        # Save preprocessor config in standard HuggingFace format
+        config = {
+            "feature_extractor_type": "NemotronParseImageProcessor",
+            "image_processor_type": "NemotronParseImageProcessor",
+            "processor_class": "NemotronParseImageProcessor",
+            "size": {"height": self.final_size[0], "width": self.final_size[1], "longest_edge": self.final_size},
+            "final_size": self.final_size,
+        }
+
+        config_path = os.path.join(save_directory, "preprocessor_config.json")
+        with open(config_path, "w") as f:
+            json.dump(config, f, indent=2)
+
+    def _resize_with_aspect_ratio(self, image: np.ndarray) -> np.ndarray:
+        """Resize image maintaining aspect ratio (exact replica of original LongestMaxSizeHW)."""
+        height, width = image.shape[:2]
+        max_size_height = self.target_height
+        max_size_width = self.target_width
+
+        # Original LongestMaxSizeHW algorithm from custom_augmentations.py
+        aspect_ratio = width / height
+        new_height = height
+        new_width = width
+
+        if height > max_size_height:
+            new_height = max_size_height
+            new_width = int(new_height * aspect_ratio)
+
+        if new_width > max_size_width:
+            new_width = max_size_width
+            new_height = int(new_width / aspect_ratio)
+
+        return cv2.resize(image, (new_width, new_height), interpolation=cv2.INTER_LINEAR)
+
+    def _pad_to_size(self, image: np.ndarray) -> np.ndarray:
+        """Pad image to target size with white padding (matches A.PadIfNeeded behavior)."""
+        h, w = image.shape[:2]
+        min_height, min_width = self.target_height, self.target_width
+
+        pad_h = max(0, min_height - h)
+        pad_w = max(0, min_width - w)
+
+        if pad_h == 0 and pad_w == 0:
+            return image
+
+        if len(image.shape) == 3:
+            padded = np.pad(image, ((0, pad_h), (0, pad_w), (0, 0)), mode="constant", constant_values=255)
+        else:
+            padded = np.pad(image, ((0, pad_h), (0, pad_w)), mode="constant", constant_values=255)
+
+        return padded
+
+    def preprocess(
+        self,
+        images: ImageInput,
+        return_tensors: Optional[Union[str, TensorType]] = None,
+        **kwargs,
+    ) -> Dict[str, torch.Tensor]:
+        """
+        Preprocess an image or batch of images for the NemotronParse model.
+
+        Args:
+            images: Input image(s)
+            return_tensors: Type of tensors to return
+        """
+
+        # Ensure images is a list
+        if not isinstance(images, list):
+            images = [images]
+
+        # Ensure images are RGB
+        for i in range(len(images)):
+            images[i] = images[i].convert("RGB")
+
+        # Convert PIL images to numpy arrays if needed
+        processed_images = []
+        for image in images:
+            if isinstance(image, Image.Image):
+                image = np.asarray(image)
+            processed_images.append(image)
+
+        # Apply NemotronParse-specific transforms
+        pixel_values = []
+        for image in processed_images:
+            processed_image = self._resize_with_aspect_ratio(image)
+
+            if self.transform is not None:
+                transformed = self.transform(image=processed_image)
+                processed_image = transformed["image"]
+            else:
+                # Fallback: just pad to target size
+                processed_image = self._pad_to_size(processed_image)
+
+            pixel_values_tensor = self.torch_transform(processed_image)
+
+            if pixel_values_tensor.shape[0] == 1:
+                pixel_values_tensor = pixel_values_tensor.expand(3, -1, -1)
+
+            pixel_values.append(pixel_values_tensor)
+
+        pixel_values = torch.stack(pixel_values)
+
+        data = {"pixel_values": pixel_values}
+
+        if return_tensors is not None:
+            data = self._convert_output_format(data, return_tensors)
+
+        return data
+
+    def _convert_output_format(self, data: Dict[str, torch.Tensor], return_tensors: Union[str, TensorType]) -> Dict:
+        """Convert output format based on return_tensors parameter."""
+        if return_tensors == "pt" or return_tensors == TensorType.PYTORCH:
+            return data
+        elif return_tensors == "np" or return_tensors == TensorType.NUMPY:
+            return {k: v.numpy() for k, v in data.items()}
+        else:
+            return data
+
+    def __call__(self, images: Union[Image.Image, List[Image.Image]], **kwargs) -> Dict[str, torch.Tensor]:
+        """Process images for the model (backward compatibility)."""
+        return self.preprocess(images, **kwargs)
+
+
+class _NemotronParseImageProcessor:
     """
     NemotronParse Image Processor
     """
@@ -388,9 +624,6 @@ class NemotronParseImageProcessor:
             self.final_size = (int(final_size), int(final_size))
         else:
             self.final_size = DEFAULT_FINAL_IMAGE_SIZE  # Default fallback
-
-        self.norm_mean = torch.Tensor(OPENAI_CLIP_MEAN).reshape(1, 3, 1, 1)
-        self.norm_std = torch.Tensor(OPENAI_CLIP_STD).reshape(1, 3, 1, 1)
 
         # Create transforms
         self._create_transforms()
@@ -543,9 +776,8 @@ class NemotronParseImageProcessor:
         # Stack into batch
         pixel_values = torch.stack(pixel_values)
 
-        # Normalize pixel values
-        normalized_values = (pixel_values - self.norm_mean) / self.norm_std
-        return {"pixel_values": normalized_values}
+        # Note: normalization is done within the RADIO model
+        return {"pixel_values": pixel_values}
 
     def __call__(
         self, images: Image.Image | list[Image.Image], **kwargs
