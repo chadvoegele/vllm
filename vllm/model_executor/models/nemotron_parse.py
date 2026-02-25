@@ -951,8 +951,12 @@ class RadioWithNeck(nn.Module):
         super().__init__()
         self.config = config.encoder
 
+        # RadioModel receives no prefix, so its internal ColumnParallelLinear
+        # layers register as e.g. "model.blocks.0.attn.qkv" — not matching the
+        # "encoder*" ignore pattern in the quantization config.  Always pass
+        # quant_config=None so the ViT layers stay in BF16 as intended.
         self.model_encoder = self.get_vit_model_from_radio_config(
-            config, quant_config=quant_config
+            config, quant_config=None
         )
 
         # Neck components
