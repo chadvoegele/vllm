@@ -724,7 +724,7 @@ class RadioWithNeck(nn.Module):
         # "encoder*" ignore pattern in the quantization config.  Always pass
         # quant_config=None so the ViT layers stay in BF16 as intended.
         self.model_encoder = self.get_vit_model_from_radio_config(
-            config, quant_config=None
+            config, quant_config=quant_config
         )
 
         # Neck components
@@ -829,7 +829,7 @@ class NemotronParseForConditionalGeneration(nn.Module, SupportsMultiModal):
 
         with self._mark_tower_model(vllm_config, "image"):
             self.encoder = RadioWithNeck(
-                config=config, quant_config=quant_config, prefix=f"{prefix}.encoder"
+                config=config, quant_config=None, prefix=f"{prefix}.encoder"
             )
 
         with self._mark_language_model(vllm_config):
