@@ -992,11 +992,7 @@ class MiniMaxM3SparseForCausalLM(nn.Module, SupportsEagle3):
 
 
 def _remap_minimax_m3_hf5_name(name: str) -> str:
-    """Map transformers>=5.12 (PR #46600) MiniMax-M3 weight names to the
-    legacy/original-checkpoint names this loader expects. ModelOpt PTQ via
-    transformers>=5.12 exports the native names; this converts them back.
-    Names already in the legacy form pass through untouched.
-    """
+    """Map transformers>=5.12 MiniMax-M3 weight names to original-checkpoint names."""
     if name == "lm_head.weight":
         return "language_model.lm_head.weight"
     if name.startswith("model.vision_tower."):
@@ -1027,27 +1023,27 @@ def _remap_minimax_m3_hf5_name(name: str) -> str:
     return name
 
 
+def _split_minimax_m3_gate_up(name, w):
+    """Split a fused ``gate_up_proj`` tensor into gate/up halves."""
+    for suffix in ("weight", "weight_scale_inv"):
+        tail = f".gate_up_proj.{suffix}"
+        if name.endswith(tail):
+            half = w.shape[0] // 2
+            base = name[: -len(f"gate_up_proj.{suffix}")]
+            yield f"{base}gate_proj.{suffix}", w[:half]
+            yield f"{base}up_proj.{suffix}", w[half:]
+            return
+    yield name, w
+
+
 def _expand_minimax_m3_hf5_weights(weights):
     """Remap transformers>=5.12 names and split fused gate/up projections.
 
-    The dense MLP and shared-expert MLP are stored by transformers>=5.12 as a single
-    fused ``gate_up_proj`` of shape ``[2*intermediate, hidden]`` (gate = first half,
-    up = second half). vLLM loads them split, so emit two tensors. This handles BOTH
-    the ``.weight`` and the MXFP8 per-block ``.weight_scale_inv`` (split on the same
-    dim-0 halves). Routed experts are already per-expert split (w1/w3) and untouched.
+    Routed experts are already per-expert split (w1/w3) and untouched.
     """
     for name, w in weights:
         rn = _remap_minimax_m3_hf5_name(name)
-        for suffix in ("weight", "weight_scale_inv"):
-            tail = f".gate_up_proj.{suffix}"
-            if rn.endswith(tail):
-                half = w.shape[0] // 2
-                base = rn[: -len(f"gate_up_proj.{suffix}")]
-                yield f"{base}gate_proj.{suffix}", w[:half]
-                yield f"{base}up_proj.{suffix}", w[half:]
-                break
-        else:
-            yield rn, w
+        yield from _split_minimax_m3_gate_up(rn, w)
 
 
 @MULTIMODAL_REGISTRY.register_processor(
@@ -1072,10 +1068,7 @@ class MiniMaxM3SparseForConditionalGeneration(
 
     hf_to_vllm_mapper = WeightsMapper(
         orig_to_new_prefix={
-            # transformers>=5.12 (HF-canonical) -> legacy/internal naming. Critical for
-            # exclude_modules / quantized_layers: vLLM runs the HF-named config patterns
-            # through this mapper before matching internal module prefixes. No-op on
-            # weights (already remapped by _expand_minimax_m3_hf5_weights).
+            # transformers (HF-canonical) naming
             "model.language_model.": "language_model.model.",
             "lm_head": "language_model.lm_head",
             "multi_modal_projector.": "vision_tower.multi_modal_projector.",
@@ -1084,7 +1077,7 @@ class MiniMaxM3SparseForConditionalGeneration(
         orig_to_new_substr={
             ".mlp.fc1.": ".fc1.",
             ".mlp.fc2.": ".fc2.",
-            # MoE container rename for shared-expert exclude patterns.
+            # transformers (HF-canonical) naming
             ".mlp.shared_experts": ".block_sparse_moe.shared_experts",
         },
     )
