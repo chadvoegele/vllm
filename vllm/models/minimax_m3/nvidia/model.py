@@ -12,6 +12,7 @@ The MiniMax-M3-preview config selects a single set of branches:
       "index" attention branch.
 """
 
+import re
 from collections.abc import Iterable
 
 import torch
@@ -990,6 +991,65 @@ class MiniMaxM3SparseForCausalLM(nn.Module, SupportsEagle3):
         return loader.load_weights(weights)
 
 
+def _remap_minimax_m3_hf5_name(name: str) -> str:
+    """Map transformers>=5.12 (PR #46600) MiniMax-M3 weight names to the
+    legacy/original-checkpoint names this loader expects. ModelOpt PTQ via
+    transformers>=5.12 exports the native names; this converts them back.
+    Names already in the legacy form pass through untouched.
+    """
+    if name == "lm_head.weight":
+        return "language_model.lm_head.weight"
+    if name.startswith("model.vision_tower."):
+        sub = name[len("model.vision_tower.") :]
+        sub = sub.replace("embeddings.proj.", "embeddings.patch_embedding.")
+        sub = re.sub(r"^layers\.", "encoder.layers.", sub)
+        return "vision_tower.vision_model." + sub
+    if name.startswith("model.multi_modal_projector."):
+        sub = name[len("model.multi_modal_projector.") :]
+        if sub.startswith("merge_linear_"):
+            return "patch_merge_mlp." + sub.replace("merge_linear_", "linear_", 1)
+        return "multi_modal_projector." + sub
+    if name.startswith("model.language_model."):
+        sub = name[len("model.language_model.") :]
+        sub = sub.replace(
+            ".mlp.gate.e_score_correction_bias",
+            ".block_sparse_moe.e_score_correction_bias",
+        )
+        sub = sub.replace(".mlp.gate.weight", ".block_sparse_moe.gate.weight")
+        sub = sub.replace(".mlp.experts.", ".block_sparse_moe.experts.")
+        sub = sub.replace(".mlp.shared_experts.", ".block_sparse_moe.shared_experts.")
+        sub = re.sub(r"(block_sparse_moe\.experts\.\d+\.)gate_proj", r"\1w1", sub)
+        sub = re.sub(r"(block_sparse_moe\.experts\.\d+\.)up_proj", r"\1w3", sub)
+        sub = re.sub(r"(block_sparse_moe\.experts\.\d+\.)down_proj", r"\1w2", sub)
+        for br in ("q_proj", "k_proj", "q_norm", "k_norm"):
+            sub = sub.replace(f".self_attn.indexer.{br}", f".self_attn.index_{br}")
+        return "language_model.model." + sub
+    return name
+
+
+def _expand_minimax_m3_hf5_weights(weights):
+    """Remap transformers>=5.12 names and split fused gate/up projections.
+
+    The dense MLP and shared-expert MLP are stored by transformers>=5.12 as a single
+    fused ``gate_up_proj`` of shape ``[2*intermediate, hidden]`` (gate = first half,
+    up = second half). vLLM loads them split, so emit two tensors. This handles BOTH
+    the ``.weight`` and the MXFP8 per-block ``.weight_scale_inv`` (split on the same
+    dim-0 halves). Routed experts are already per-expert split (w1/w3) and untouched.
+    """
+    for name, w in weights:
+        rn = _remap_minimax_m3_hf5_name(name)
+        for suffix in ("weight", "weight_scale_inv"):
+            tail = f".gate_up_proj.{suffix}"
+            if rn.endswith(tail):
+                half = w.shape[0] // 2
+                base = rn[: -len(f"gate_up_proj.{suffix}")]
+                yield f"{base}gate_proj.{suffix}", w[:half]
+                yield f"{base}up_proj.{suffix}", w[half:]
+                break
+        else:
+            yield rn, w
+
+
 @MULTIMODAL_REGISTRY.register_processor(
     MiniMaxM3VLMultiModalProcessor,
     info=MiniMaxM3VLProcessingInfo,
@@ -1012,12 +1072,20 @@ class MiniMaxM3SparseForConditionalGeneration(
 
     hf_to_vllm_mapper = WeightsMapper(
         orig_to_new_prefix={
+            # transformers>=5.12 (HF-canonical) -> legacy/internal naming. Critical for
+            # exclude_modules / quantized_layers: vLLM runs the HF-named config patterns
+            # through this mapper before matching internal module prefixes. No-op on
+            # weights (already remapped by _expand_minimax_m3_hf5_weights).
+            "model.language_model.": "language_model.model.",
+            "lm_head": "language_model.lm_head",
             "multi_modal_projector.": "vision_tower.multi_modal_projector.",
             "patch_merge_mlp.": "vision_tower.patch_merge_mlp.",
         },
         orig_to_new_substr={
             ".mlp.fc1.": ".fc1.",
             ".mlp.fc2.": ".fc2.",
+            # MoE container rename for shared-expert exclude patterns.
+            ".mlp.shared_experts": ".block_sparse_moe.shared_experts",
         },
     )
 
@@ -1189,4 +1257,6 @@ class MiniMaxM3SparseForConditionalGeneration(
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         loader = AutoWeightsLoader(self)
-        return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
+        return loader.load_weights(
+            _expand_minimax_m3_hf5_weights(weights), mapper=self.hf_to_vllm_mapper
+        )
