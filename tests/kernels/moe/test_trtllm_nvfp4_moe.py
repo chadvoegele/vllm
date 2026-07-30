@@ -4,8 +4,8 @@
 Tests for the FlashInfer TRTLLM NvFP4 MoE backend
 (`TrtLlmNvFp4ExpertsModular`).
 
-Covers the activations the wrapper claims to support — SiLU, RELU^2 (non-gated),
-and GELU — including a Gemma4-shaped case (128 experts, top-k 8,
+Covers the activations the wrapper claims to support — SiLU, SITU, RELU^2
+(non-gated), and GELU — including a Gemma4-shaped case (128 experts, top-k 8,
 intermediate_size 704) that exercises the non-256-aligned padding path.
 """
 
@@ -23,7 +23,7 @@ from tests.kernels.utils import torch_moe
 from vllm import _custom_ops as ops
 from vllm.config import ParallelConfig, VllmConfig, set_current_vllm_config
 from vllm.model_executor.custom_op import CustomOp, op_registry
-from vllm.model_executor.layers.activation import SiluAndMulWithClamp
+from vllm.model_executor.layers.activation import SiluAndMulWithClamp, SituAndMul
 from vllm.model_executor.layers.fused_moe import fused_topk
 from vllm.model_executor.layers.fused_moe.activation import MoEActivation
 from vllm.model_executor.layers.fused_moe.all2all_utils import (
@@ -63,6 +63,9 @@ MNK_FACTORS = [
 _SWIGLU_LIMIT = 0.1
 _LARGE_OUTPUT1_SCALE = 32768.0
 _CLAMP_OP_NAME = "test_silu_and_mul_with_clamp"
+_SITU_BETA = 4.0
+_SITU_LINEAR_BETA = 25.0
+_SITU_OP_NAME = "test_situ_and_mul"
 
 # Test-only fixed-limit clamp. ``custom_op_name`` makes the class itself
 # valid as an ``activation=`` argument to ``torch_moe`` (which only looks
@@ -80,6 +83,22 @@ if _CLAMP_OP_NAME not in op_registry:
 
 SILU_WITH_CLAMP = op_registry[_CLAMP_OP_NAME]
 
+if _SITU_OP_NAME not in op_registry:
+
+    @CustomOp.register(_SITU_OP_NAME)
+    class _SituAndMulTest(SituAndMul):
+        custom_op_name = _SITU_OP_NAME
+
+        def __init__(self, *, compile_native: bool = True) -> None:
+            super().__init__(
+                _SITU_BETA,
+                _SITU_LINEAR_BETA,
+                compile_native=compile_native,
+            )
+
+
+SITU = op_registry[_SITU_OP_NAME]
+
 
 ACTIVATION_CASES = [
     pytest.param(MoEActivation.SILU, MoEActivation.SILU, None, id="silu"),
@@ -91,6 +110,7 @@ ACTIVATION_CASES = [
         id="relu2_no_mul",
     ),
     pytest.param(MoEActivation.GELU, MoEActivation.GELU, None, id="gelu"),
+    pytest.param(MoEActivation.SITU, SITU, None, id="situ"),
 ]
 
 
@@ -112,6 +132,9 @@ def test_trtllm_fp4_moe_no_graph(
     swiglu_limit: float | None,
     workspace_init,
 ):
+    if activation == MoEActivation.SITU and (m, n, k) != MNK_FACTORS[0]:
+        pytest.skip("One aligned shape is sufficient for the SITU scale regression")
+
     # FlashInfer's trtllm_batched_gemm_runner has no precompiled tile
     # config for non-gated RELU^2 at non-256-aligned intermediate_size
     # (e.g. Gemma4's 704). Other activations (SiLU/GELU) work at the
@@ -173,6 +196,12 @@ def test_trtllm_fp4_moe_no_graph(
             in_dtype=dtype,
             routing_method=RoutingMethodType.TopK,
             max_num_tokens=next_power_of_2(m),
+            activation_situ_beta=(
+                _SITU_BETA if activation == MoEActivation.SITU else None
+            ),
+            activation_situ_linear_beta=(
+                _SITU_LINEAR_BETA if activation == MoEActivation.SITU else None
+            ),
         )
 
         trtllm_inner = TrtLlmNvFp4ExpertsModular(
